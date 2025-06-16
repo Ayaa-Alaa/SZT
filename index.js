@@ -10,9 +10,9 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const CHAIN_ID = 16601;
 const RPC_URL = 'https://evmrpc-testnet.0g.ai';
 const CONTRACT_ADDRESS = '0x5f1d96895e442fc0168fa2f9fb1ebef93cb5035e';
-const METHOD_ID = '0xef3e12dc';
 const INDEXER_URL = 'https://indexer-storage-testnet-turbo.0g.ai';
 const EXPLORER_URL = 'https://chainscan-galileo.0g.ai/tx/';
+const PROXY_FILE = 'proxies.txt';
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -21,6 +21,8 @@ const rl = readline.createInterface({
 
 let privateKeys = [];
 let currentKeyIndex = 0;
+let proxies = [];
+let currentProxyIndex = 0;
 
 // Fungsi untuk mengambil delay acak antara 60 hingga 120 detik
 const randomDelay = () => {
@@ -41,6 +43,66 @@ function loadPrivateKeys() {
     privateKeys.push(key);
     index++;
     key = process.env[`PRIVATE_KEY_${index}`];
+  }
+}
+
+// Rotasi Private Key untuk distribusi transaksi
+function getNextPrivateKey() {
+  return privateKeys[currentKeyIndex];
+}
+
+function rotatePrivateKey() {
+  currentKeyIndex = (currentKeyIndex + 1) % privateKeys.length;
+  return privateKeys[currentKeyIndex];
+}
+
+// Memuat daftar proxy dari file eksternal
+function loadProxies() {
+  try {
+    if (fs.existsSync(PROXY_FILE)) {
+      const data = fs.readFileSync(PROXY_FILE, 'utf8');
+      proxies = data.split('\n').map(line => line.trim()).filter(line => line);
+      console.log(`Loaded ${proxies.length} proxies from file.`);
+    }
+  } catch (error) {
+    console.error(`Error loading proxies: ${error.message}`);
+  }
+}
+
+// Menggunakan proxy secara bergilir
+function getNextProxy() {
+  if (proxies.length === 0) return null;
+  const proxy = proxies[currentProxyIndex];
+  currentProxyIndex = (currentProxyIndex + 1) % proxies.length;
+  return proxy;
+}
+
+// Membuat instance Axios dengan pengaturan proxy dan header yang sesuai
+function createAxiosInstance() {
+  const config = {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible)',
+      'accept': 'application/json',
+    }
+  };
+
+  const proxy = getNextProxy();
+  if (proxy) {
+    config.httpsAgent = new HttpsProxyAgent(proxy);
+  }
+
+  return axios.create(config);
+}
+
+// Mengecek apakah jaringan blockchain sudah sinkron
+async function checkNetworkSync(provider) {
+  try {
+    const blockNumber = await provider.getBlockNumber();
+    console.log(`Network synced at block ${blockNumber}`);
+    return true;
+  } catch (error) {
+    console.error(`Network sync check failed: ${error.message}`);
+    return false;
   }
 }
 
@@ -68,7 +130,8 @@ function fetchLocalFile(filePath) {
 // Fungsi untuk mengambil random file dari Picsum
 async function fetchRandomImageFromPicsum() {
   try {
-    const response = await axios.get('https://picsum.photos/200', { responseType: 'arraybuffer' });
+    const axiosInstance = createAxiosInstance();
+    const response = await axiosInstance.get('https://picsum.photos/200', { responseType: 'arraybuffer' });
     return response.data;
   } catch (error) {
     throw error;
@@ -82,8 +145,9 @@ async function prepareImageData(imageBuffer) {
 }
 
 // Fungsi untuk mengunggah file ke storage
-async function uploadToStorage(imageData, wallet, walletIndex) {
+async function uploadToStorage(imageData, wallet) {
   try {
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
     const value = ethers.parseEther('0.000839233398436224');
     const txParams = {
       to: CONTRACT_ADDRESS,
@@ -106,43 +170,36 @@ async function uploadToStorage(imageData, wallet, walletIndex) {
 async function main() {
   try {
     loadPrivateKeys();
+    loadProxies();
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
+    
+    const isNetworkSynced = await checkNetworkSync(provider);
+    if (!isNetworkSynced) {
+      throw new Error('Network is not synced');
+    }
 
     rl.question(`Pilih mode upload:\n [1] Ambil random file dari Picsum\n [2] Unggah file dari folder storage\nMasukkan pilihan (1 atau 2): `, async (option) => {
       option = option.trim();
 
       if (option === '1') {
-        rl.question('Jumlah file yang ingin diupload per wallet? ', async (count) => {
-          count = parseInt(count);
-          if (isNaN(count) || count <= 0) {
-            rl.close();
-            process.exit(1);
-            return;
+        let successful = 0;
+        let failed = 0;
+
+        for (const key of privateKeys) {
+          const wallet = new ethers.Wallet(key, provider);
+          try {
+            const imageBuffer = await fetchRandomImageFromPicsum();
+            const imageData = await prepareImageData(imageBuffer);
+            await uploadToStorage(imageData, wallet);
+            successful++;
+          } catch (error) {
+            failed++;
           }
+          await randomDelay();
+        }
 
-          let successful = 0;
-          let failed = 0;
-
-          for (let walletIndex = 0; walletIndex < privateKeys.length; walletIndex++) {
-            currentKeyIndex = walletIndex;
-            const wallet = new ethers.Wallet(privateKeys[walletIndex], new ethers.JsonRpcProvider(RPC_URL));
-
-            for (let i = 1; i <= count; i++) {
-              try {
-                const imageBuffer = await fetchRandomImageFromPicsum();
-                const imageData = await prepareImageData(imageBuffer);
-                await uploadToStorage(imageData, wallet, walletIndex);
-                successful++;
-              } catch (error) {
-                failed++;
-              }
-              await randomDelay(); // Menambahkan delay acak sebelum upload berikutnya
-            }
-          }
-
-          rl.close();
-          process.exit(0);
-        });
-
+        rl.close();
+        process.exit(0);
       } else if (option === '2') {
         const localFiles = getLocalFiles();
         if (localFiles.length === 0) {
@@ -154,26 +211,21 @@ async function main() {
         let failed = 0;
 
         for (let i = 0; i < localFiles.length; i++) {
-          const walletIndex = i % privateKeys.length;
-          currentKeyIndex = walletIndex;
-          const wallet = new ethers.Wallet(privateKeys[walletIndex], new ethers.JsonRpcProvider(RPC_URL));
-
+          const wallet = new ethers.Wallet(getNextPrivateKey(), provider);
+          rotatePrivateKey();
           try {
             const fileBuffer = await fetchLocalFile(localFiles[i]);
             const imageData = await prepareImageData(fileBuffer);
-            await uploadToStorage(imageData, wallet, walletIndex);
+            await uploadToStorage(imageData, wallet);
             successful++;
           } catch (error) {
             failed++;
           }
-          await randomDelay(); // Menambahkan delay acak sebelum upload berikutnya
+          await randomDelay();
         }
 
         rl.close();
         process.exit(0);
-      } else {
-        rl.close();
-        process.exit(1);
       }
     });
   } catch (error) {
