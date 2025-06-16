@@ -144,16 +144,31 @@ async function prepareImageData(imageBuffer) {
   return { root: hash, data: imageBuffer.toString('base64') };
 }
 
-// Fungsi untuk mengunggah file ke storage
+// Fungsi untuk mengunggah file ke storage (Gas Limit dengan Estimasi dan Buffer 50%)
 async function uploadToStorage(imageData, wallet) {
   try {
     const provider = new ethers.JsonRpcProvider(RPC_URL);
-    const value = ethers.parseEther('0.000839233398436224');
+    
+    console.log('Estimating gas...');
+    let gasLimit;
+    try {
+      const gasEstimate = await provider.estimateGas({
+        to: CONTRACT_ADDRESS,
+        data: imageData.root,
+        value: ethers.parseEther('0.000839233398436224')
+      });
+      gasLimit = BigInt(gasEstimate) * 15n / 10n; // Buffer 50% tambahan
+      console.log(`Gas limit set: ${gasLimit}`);
+    } catch (error) {
+      gasLimit = 300000n; // Default jika estimasi gagal
+      console.warn(`Gas estimation failed, using default: ${gasLimit}`);
+    }
+
     const txParams = {
       to: CONTRACT_ADDRESS,
       data: imageData.root,
-      value,
-      gasLimit: 300000,
+      value: ethers.parseEther('0.000839233398436224'),
+      gasLimit,
       gasPrice: ethers.parseUnits('1.029599997', 'gwei'),
       chainId: CHAIN_ID
     };
@@ -182,33 +197,22 @@ async function main() {
       option = option.trim();
 
       if (option === '1') {
-        let successful = 0;
-        let failed = 0;
-
         for (const key of privateKeys) {
           const wallet = new ethers.Wallet(key, provider);
           try {
             const imageBuffer = await fetchRandomImageFromPicsum();
             const imageData = await prepareImageData(imageBuffer);
             await uploadToStorage(imageData, wallet);
-            successful++;
-          } catch (error) {
-            failed++;
-          }
+          } catch (error) {}
           await randomDelay();
         }
-
         rl.close();
-        process.exit(0);
       } else if (option === '2') {
         const localFiles = getLocalFiles();
         if (localFiles.length === 0) {
           rl.close();
-          process.exit(1);
+          return;
         }
-
-        let successful = 0;
-        let failed = 0;
 
         for (let i = 0; i < localFiles.length; i++) {
           const wallet = new ethers.Wallet(getNextPrivateKey(), provider);
@@ -217,20 +221,14 @@ async function main() {
             const fileBuffer = await fetchLocalFile(localFiles[i]);
             const imageData = await prepareImageData(fileBuffer);
             await uploadToStorage(imageData, wallet);
-            successful++;
-          } catch (error) {
-            failed++;
-          }
+          } catch (error) {}
           await randomDelay();
         }
-
         rl.close();
-        process.exit(0);
       }
     });
   } catch (error) {
     rl.close();
-    process.exit(1);
   }
 }
 
